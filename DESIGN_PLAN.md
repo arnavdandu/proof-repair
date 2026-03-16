@@ -1,261 +1,262 @@
-# Lean Proof Repair Tool — Design Plan (Pre-Build)
+# Where Were We? — VS Code Extension Design Plan (Pre-Build)
 
 ## 1) Problem Statement
 
-Mathlib/dependency updates frequently invalidate previously working Lean proofs. Today, users manually inspect broken files, infer what changed in tactics/lemmas/typeclass behavior, and patch proofs with little guidance.
+Developers often pause work mid-stream and later return with low context:
+- What files were touched?
+- What decisions were made?
+- What is finished vs in progress?
+- What should happen next?
 
-This project aims to provide a **focused proof-repair workflow** that:
-- Anchors each failure to the **last-known-good line** from an older commit/version.
-- Shows **old vs. new proof state side-by-side** for the same source location.
-- Supports both **manual editing** and **LLM-assisted automated repair**.
-- Leverages familiar **VS Code merge/diff resolution UX**.
+This extension captures coding-session activity and generates a concise LLM summary so you can re-enter a project quickly with the right context.
 
 ## 2) Product Vision
 
-Create a developer tool that turns proof breakage into a deterministic repair loop:
-1. Detect breakages under new dependencies.
-2. Recover corresponding successful context from an old snapshot.
-3. Render old/new source and old/new proof states in side-by-side panes.
-4. Let user resolve manually or request AI-generated candidate patch.
-5. Validate by recompilation/tests and persist accepted fix.
+Build a **session memory layer for VS Code** that continuously records useful signals (edits, commands, diagnostics, git changes, optional notes) and transforms them into:
+1. **Quick resume summaries** when reopening a workspace.
+2. **Project re-acquaintance briefs** (structure, active areas, recent progress).
+3. **Open-issues + next-steps lists** grounded in observed activity.
+
+Core promise: _"In under 60 seconds, know where you left off and what to do next."_
 
 ## 3) Primary Users
 
-- Lean project maintainers upgrading mathlib.
-- Researchers with large formalization codebases.
-- Contributors preparing compatibility PRs for dependency bumps.
+- Solo developers juggling multiple repos.
+- Team members context-switching across tasks.
+- Anyone returning to a codebase after hours/days/weeks.
 
 ## 4) Core User Stories
 
-1. **As a maintainer**, I can select an old commit (or lockfile baseline) and current workspace, run analysis, and get a list of broken declarations.
-2. **As a maintainer**, I can open a single broken declaration in VS Code with old/new code + old/new proof state aligned.
-3. **As a maintainer**, I can request an LLM fix proposal constrained to this declaration and current imports.
-4. **As a maintainer**, I can apply, inspect, and re-run Lean checking to confirm the fix.
-5. **As a maintainer**, I can iterate candidate fixes and keep an audit trail of what changed and why.
+1. **As a developer**, when I reopen VS Code, I see "Last session summary" with key changes and next actions.
+2. **As a developer**, I can inspect a timeline of session events (edited files, commits, errors fixed, commands run).
+3. **As a developer**, I can trigger "Summarize current work" at any time.
+4. **As a developer**, I can copy/export summary into a PR, issue, or daily log.
+5. **As a privacy-conscious user**, I can control what data is captured and whether LLM calls are local or remote.
 
 ## 5) Non-Goals (V1)
 
-- Full automatic migration of an entire codebase with zero user review.
-- Re-implementing Lean elaboration internals.
-- Supporting all editors (V1 targets VS Code first).
-- Solving semantic theorem changes requiring large refactors outside local declarations.
+- Full autonomous project management.
+- Rewriting code automatically based on logs.
+- Capturing every keystroke or full file snapshots by default.
+- Cross-IDE support (V1 is VS Code only).
 
 ## 6) High-Level Architecture
 
 ### 6.1 Components
 
-1. **Snapshot Manager**
-   - Resolves baseline (old) vs target (new) revisions.
-   - Checks out/builds each snapshot in isolated workdirs.
+1. **Event Collector (VS Code extension host)**
+   - Subscribes to editor/workspace events.
+   - Captures structured metadata (not raw keystrokes by default).
 
-2. **Failure Indexer**
-   - Runs Lean diagnostics on target snapshot.
-   - Extracts broken declarations, locations, and messages.
+2. **Session Manager**
+   - Starts/ends sessions (manual + idle-timeout heuristics).
+   - Maintains active session state and session IDs.
 
-3. **Context Extractor**
-   - For each failure, maps to corresponding location in baseline.
-   - Captures source slices and proof states at critical points.
+3. **Local Event Store**
+   - Persists events + derived snapshots in local SQLite/JSONL.
+   - Supports retention and cleanup policies.
 
-4. **State Capture Engine**
-   - Uses Lean/LSP info APIs to capture goals/context at cursor/line.
-   - Produces normalized, machine-readable state records.
+4. **Context Synthesizer**
+   - Aggregates raw events into compact context packets:
+     - touched modules,
+     - changed files,
+     - diagnostics trend,
+     - git diff stats,
+     - command history summary.
 
-5. **Diff/Resolution UI Adapter (VS Code extension layer)**
-   - Opens side-by-side view:
-     - Left: baseline line + baseline proof state.
-     - Right: target line + broken target proof state.
-   - Adds actions: “Ask LLM”, “Apply Candidate”, “Re-check”.
+5. **LLM Summary Engine**
+   - Prompt builder + provider abstraction (OpenAI-compatible/local).
+   - Produces multiple summary formats (short/long/actionable).
 
-6. **LLM Repair Engine**
-   - Builds constrained prompt from local declaration, imports, diagnostics, states.
-   - Produces minimal patch candidates.
-   - Ranks candidates by compile success + heuristic quality.
-
-7. **Validation Runner**
-   - Rechecks declaration/file/project.
-   - Returns pass/fail + remaining diagnostics.
-
-8. **Change Ledger**
-   - Records attempted fixes, prompts (optional redacted), model outputs, outcomes.
+6. **UI Layer**
+   - Activity Bar view: recent sessions + summaries.
+   - Commands: "Summarize Session", "Resume Context", "Export Summary".
+   - Optional startup notification with quick resume card.
 
 ### 6.2 Data Flow
 
-1. User selects baseline commit/tag + target branch.
-2. Tool compiles both snapshots and collects metadata.
-3. Tool identifies breakages in target.
-4. For each breakage, tool aligns baseline declaration/line.
-5. Tool captures old/new proof states at aligned point.
-6. UI renders diff + states and offers repair actions.
-7. User/manual or LLM applies patch.
-8. Validator checks result; accepted fix committed to working tree.
+1. Session starts (workspace opened or command-triggered).
+2. Event collector logs activity.
+3. On trigger/interval/session end, synthesizer compacts context.
+4. LLM engine generates summary + open issues + next steps.
+5. Summary is stored and shown in UI; user can copy/export.
 
-## 7) Proof-State Alignment Strategy
+## 7) Event Model (V1)
 
-This is the hardest part. Use layered matching:
+Capture **high-signal, low-risk** events:
 
-1. **Declaration-level anchor (primary)**
-   - Match by fully-qualified declaration name.
-   - If renamed/moved, fallback to git similarity + syntax signature.
+- File events: opened, edited, saved, renamed.
+- Git events: branch changes, commit hash, changed files (from `git status`/`git diff --name-only`).
+- Diagnostic events: counts by severity, top recurring errors.
+- Task/terminal events (opt-in): executed command text + exit status.
+- Navigation events: symbol/file switches (coarse-grained).
+- User notes (manual): "checkpoint note" command.
 
-2. **Intra-declaration line mapping**
-   - Compute token/AST-aware diff within declaration body.
-   - Map broken line to nearest equivalent baseline span.
+### Example event schema
 
-3. **State capture points**
-   - At minimum: failing line cursor.
-   - Optional: previous tactic boundary and declaration start.
+```json
+{
+  "ts": "2026-03-16T10:24:11Z",
+  "sessionId": "sess_abc123",
+  "type": "file.saved",
+  "workspace": "/path/repo",
+  "payload": {
+    "path": "src/service/auth.ts",
+    "language": "typescript",
+    "locDelta": 24
+  }
+}
+```
 
-4. **Confidence score**
-   - Score mapping quality (exact name + high textual similarity + AST shape).
-   - Warn user if confidence is low.
+## 8) Summary Outputs
 
-## 8) VS Code UX Plan
+Generate three views from same context:
 
-### 8.1 Main Views
+1. **TL;DR (30s)**
+   - "You modified auth flow + tests, fixed 2 lint errors, 1 failing test remains."
 
-- **Breakage List Panel**
-  - Declaration name, file, error summary, mapping confidence, status.
+2. **Progress Digest (2–3 min)**
+   - What changed, why (inferred), where (files/modules), and confidence.
 
-- **Repair Workspace (side-by-side)**
-  - Left editor: baseline declaration snippet.
-  - Right editor: target editable declaration snippet.
-  - Proof state panes below/alongside each editor.
+3. **Action List**
+   - Open issues,
+   - likely blockers,
+   - concrete next commands/files.
 
-- **Action Bar**
-  - Ask LLM
-  - Generate N candidates
-  - Apply candidate
-  - Re-check declaration
-  - Re-check file
+## 9) Prompting Strategy
 
-### 8.2 Interaction Details
+### 9.1 Prompt Inputs
 
-- Selecting a failure opens a structured “resolve session”.
-- Cursor-linked state refresh on both sides.
-- Candidate patch preview in diff before apply.
-- Inline diagnostics update after each check.
-- Keyboard-centric flow for rapid triage.
+- Session metadata (duration, active windows, branch).
+- Top edited files + churn stats.
+- Diagnostics before/after counts.
+- Git status + latest commit message(s).
+- Optional user notes/checkpoints.
 
-## 9) LLM Integration Plan
+### 9.2 Constraints
 
-### 9.1 Prompt Inputs (strictly scoped)
+- Instruct model to separate **facts** (from logs) vs **inferences**.
+- Force markdown sections:
+  - `What changed`
+  - `Current status`
+  - `Open issues`
+  - `Next 3 actions`
+- Output must include confidence markers where uncertain.
 
-- Target declaration full text.
-- Baseline declaration full text.
-- Old/new proof states (at aligned location).
-- Lean diagnostic message and code.
-- Visible imports/local context.
-- Project style constraints (optional).
+### 9.3 Hallucination Control
 
-### 9.2 Guardrails
+- Provide only structured inputs; avoid full repository dumps.
+- Add explicit instruction: "Do not invent files/errors not present in inputs."
+- Optionally run post-check pass to verify file references exist.
 
-- Never edit outside selected declaration by default.
-- Minimize patch size.
-- Preserve theorem statement unless explicitly allowed.
-- Require compile check before surfacing as “viable”.
+## 10) VS Code UX Plan
 
-### 9.3 Candidate Loop
+### 10.1 Surfaces
 
-1. Generate candidate patch.
-2. Apply in temp buffer.
-3. Re-run Lean check.
-4. Keep passing/partially-improving candidates.
-5. Rank by: compile success > fewer sorrys > minimal diff.
+- **Activity Bar: Where Were We?**
+  - Session list with timestamps and branch.
+  - Click to open stored summary.
 
-## 10) Lean/Tooling Integration Details
+- **Command Palette**
+  - `Where Were We: Start Session`
+  - `Where Were We: End Session`
+  - `Where Were We: Summarize Last Session`
+  - `Where Were We: Add Checkpoint Note`
+  - `Where Were We: Export Summary`
 
-- Prefer Lean LSP endpoints for diagnostics and goal state.
-- Run two project environments:
-  - Baseline (old lock/commit).
-  - Target (current branch).
-- Cache build artifacts and state snapshots for speed.
-- Normalize file paths and module names across snapshots.
+- **Startup Resume Card**
+  - Appears on workspace reopen.
+  - Shows top 3 bullets + "Open full summary".
 
-## 11) Robustness & Edge Cases
+### 10.2 Interaction Details
 
-- Declaration deleted in new version.
-- Statement changed (proof no longer type-correct by design).
-- Massive refactors / file moves.
-- Tactic scripts replaced by term proofs.
-- New implicit args/typeclass priorities causing non-local failures.
-- Timeouts in LLM or Lean checks.
+- Auto-session starts when workspace becomes active.
+- Idle > N minutes can split sessions.
+- Manual checkpoint command inserts user-authored note into timeline.
+- Summaries are cached; regenerate only when new events exist.
 
-Fallback behavior:
-- Show best-effort mapping with low-confidence badge.
-- Allow manual override of baseline anchor.
-- Provide “open full file diff” escape hatch.
+## 11) Privacy, Security, and Trust
+
+- Default local storage under extension global state path.
+- Opt-in controls for:
+  - terminal command capture,
+  - remote LLM usage,
+  - including file snippets.
+- Redaction options:
+  - path anonymization,
+  - secret-like token stripping,
+  - command argument masking.
+- "Local-only mode" supported via local model endpoint.
 
 ## 12) Performance Targets (V1)
 
-- Initial indexing on medium project: < 2–5 minutes (cache cold).
-- Open repair session for one failure: < 2 seconds after cached states.
-- Re-check declaration candidate: < 1–3 seconds typical.
+- Event capture overhead: imperceptible (<5ms typical handler path).
+- Summary generation kickoff: <1s for local context synthesis.
+- Resume card availability on reopen: <2s when summary cached.
 
-## 13) Security & Privacy
+## 13) Suggested Tech Stack
 
-- Opt-in LLM usage.
-- Redaction policy for local paths/secrets in prompts.
-- Local-only mode (no remote model) via local inference endpoint.
-- Store telemetry only with explicit consent.
+- **Extension**: TypeScript + VS Code Extension API.
+- **Storage**: SQLite (better queries) or JSONL (simpler V1).
+- **LLM Provider Layer**: OpenAI-compatible adapter + local endpoint adapter.
+- **Validation**: zod schemas for event + summary payloads.
 
-## 14) Suggested Tech Stack
+## 14) Milestone Plan
 
-- **Core engine**: Python or Rust (or Node if tight VS Code integration priority).
-- **Editor integration**: VS Code extension (TypeScript).
-- **Process orchestration**: language-server subprocess + Lean CLI wrappers.
-- **State/cache storage**: SQLite + file-based artifact cache.
-- **Patch operations**: tree-sitter/Lean parser assisted, fallback textual patching.
+### Milestone 0 — Instrumentation Spike (1 week)
+- Capture file + diagnostic + git events reliably.
+- Persist/reload sessions locally.
 
-## 15) Milestone Plan
+### Milestone 1 — Resume MVP (1–2 weeks)
+- Session list UI + startup resume card.
+- Rule-based summary (no LLM yet) as fallback baseline.
 
-### Milestone 0 — Discovery Spike (1–2 weeks)
-- Validate extracting goal states at arbitrary cursor points.
-- Validate baseline↔target declaration matching quality.
-- Prototype side-by-side static view with synthetic data.
+### Milestone 2 — LLM Summaries (1–2 weeks)
+- Prompt builder + provider settings.
+- TL;DR + digest + action list outputs.
 
-### Milestone 1 — Manual Repair Assistant (2–4 weeks)
-- Failure index, mapping, VS Code side-by-side session.
-- Manual edit + re-check loop.
-- No LLM yet.
+### Milestone 3 — Hardening & Trust (1–2 weeks)
+- Redaction/privacy settings.
+- Better inference quality + confidence annotations.
+- Export integrations (Markdown/clipboard).
 
-### Milestone 2 — LLM Candidate Assist (2–4 weeks)
-- Prompt builder + candidate generation.
-- Apply/preview/rerank based on compile checks.
-- Session history and attempt ledger.
+## 15) Open Design Decisions
 
-### Milestone 3 — Scale & Reliability (3–6 weeks)
-- Caching, batching, better mapping heuristics.
-- Better handling for refactors/renames.
-- UX polish and keyboard workflows.
+1. Session segmentation strategy:
+   - Pure idle timeout vs explicit start/stop vs hybrid?
+2. Storage format:
+   - JSONL simplicity vs SQLite query power?
+3. Capture depth:
+   - Metadata-only default, optional snippets?
+4. Summarization timing:
+   - End-of-session only vs rolling updates?
+5. Team workflows:
+   - Single-user memory only, or optional shareable session briefs?
 
-## 16) Open Design Decisions
+## 16) Success Metrics
 
-1. Baseline selection model:
-   - Explicit git ref only, or lockfile-based auto-detection?
-2. Granularity of checks:
-   - Declaration-level incremental checking vs file-level only?
-3. Parser strategy:
-   - Lean native AST APIs vs tree-sitter fallback.
-4. Local model support:
-   - Which API schema to standardize on (OpenAI-compatible, etc.)?
-5. Multi-candidate UX:
-   - Show top-3 automatically or one-at-a-time interactive?
-
-## 17) Recommended Next Step (Before Coding)
-
-Run a **technical spike** with one real repository upgrade scenario:
-1. Pick a known commit pair that introduces breakages.
-2. Implement minimal scripts to:
-   - enumerate target errors,
-   - map one declaration to baseline,
-   - capture old/new proof states,
-   - open a prototype side-by-side VS Code view.
-3. Measure mapping quality and state-capture reliability.
-4. Use results to lock V1 architecture choices.
+- **Time-to-context**: median time from reopen to first productive edit.
+- **Summary usefulness**: user rating after resume (1–5).
+- **Adoption**: % sessions with summary viewed.
+- **Actionability**: % summaries where "Next 3 actions" are used.
 
 ---
 
-If this plan looks right, the next deliverable should be a concrete V1 specification with:
-- exact module boundaries,
-- API contracts between engine and VS Code extension,
-- and a task breakdown into implementable tickets.
+## Appendix A — Initial Command/Config Surface
+
+- `whereWereWe.enable`
+- `whereWereWe.captureTerminal` (default: false)
+- `whereWereWe.captureFileSnippets` (default: false)
+- `whereWereWe.model.provider`
+- `whereWereWe.model.endpoint`
+- `whereWereWe.privacy.redactPaths`
+- `whereWereWe.session.idleMinutes`
+
+## Appendix B — MVP Fallback Without LLM
+
+If LLM unavailable, generate deterministic summary from stats:
+- top edited files,
+- diagnostics delta,
+- uncommitted changes,
+- last checkpoint note,
+- suggested next file based on recency + errors.
